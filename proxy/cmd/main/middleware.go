@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httputil"
+	"sync/atomic"
+	"time"
 
 	"github.com/tetratelabs/wazero/api"
 )
@@ -18,7 +20,7 @@ type Instance struct {
 	free_memory     api.Function
 }
 
-func middleware(ctx context.Context, pool chan Instance, proxy *httputil.ReverseProxy) http.HandlerFunc {
+func middleware(ctx context.Context, pool *atomic.Pointer[chan Instance], m *Metrics, proxy *httputil.ReverseProxy) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		header_json, err := json.Marshal(r.Header)
 		if err != nil {
@@ -27,9 +29,13 @@ func middleware(ctx context.Context, pool chan Instance, proxy *httputil.Reverse
 			return
 		}
 
+		// Increment request count
+		m.TotalRequests.Add(1)
+
 		// Borrow an instance
-		instance := <-pool
-		defer func() { pool <- instance }()
+		ch := *pool.Load()
+		instance := <-ch
+		defer func() { ch <- instance }()
 
 		// Allocate memory
 		ptr, err := instance.allocate.Call(ctx, uint64(len(header_json)))
@@ -54,7 +60,10 @@ func middleware(ctx context.Context, pool chan Instance, proxy *httputil.Reverse
 		}
 
 		// Check header
+		start := time.Now()
 		res, err := instance.process_request.Call(ctx, ptr[0], uint64(len(header_json)))
+		m.LastExecutionNs.Store(uint64(time.Since(start).Nanoseconds()))
+
 		if err != nil {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			log.Printf("Wasm execution error: %v", err)
@@ -63,6 +72,9 @@ func middleware(ctx context.Context, pool chan Instance, proxy *httputil.Reverse
 
 		// Block if enabled
 		if res[0] == 1 {
+			// Increment blocked request count
+			m.BlockedRequests.Add(1)
+			// Block
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
